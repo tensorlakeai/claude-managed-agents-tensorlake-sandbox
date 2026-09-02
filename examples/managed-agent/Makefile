@@ -1,5 +1,5 @@
 .PHONY: build agent session webhook poll \
-	build-webhook webhook-sandbox webhook-sandbox-status webhook-sandbox-logs webhook-sandbox-rm
+	build-webhook webhook-sandbox webhook-sandbox-status webhook-sandbox-restart webhook-sandbox-logs webhook-sandbox-rm
 
 NAME ?= Managed Agent
 PROMPT ?= create hello.txt containing 'hi from the sandbox', then read it back
@@ -38,6 +38,11 @@ webhook-sandbox:
 
 webhook-sandbox-status:
 	uv run python src/launch_webhook_sandbox.py --status
+
+# Relaunch the receiver with the current .env (e.g. a rotated signing key)
+# without recreating the sandbox, so its ID-keyed public URL stays the same.
+webhook-sandbox-restart:
+	uv run python src/launch_webhook_sandbox.py --restart
 
 webhook-sandbox-logs:
 	uv run python src/launch_webhook_sandbox.py --logs

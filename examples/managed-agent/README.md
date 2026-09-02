@@ -75,7 +75,9 @@ make webhook-sandbox   # get-or-create the orchestrator sandbox, expose :5051, p
 
 The launcher prints the public URL, which is keyed by **sandbox ID** (not name): `https://5051-<sandbox-id>.sandbox.tensorlake.ai`. Register it as a **Webhook** in Claude Platform (subscribe to `Session lifecycle → Run started` — the `session.status_run_started` event the receiver keys on) and put the signing secret in `ANTHROPIC_WEBHOOK_SIGNING_KEY` in `.env` *before* running `make webhook-sandbox` — the secret is passed into the receiver at launch.
 
-Helpers: `make webhook-sandbox-status` (prints the current URL + status), `make webhook-sandbox-logs`, `make webhook-sandbox-rm`.
+Helpers: `make webhook-sandbox-status` (prints the current URL + status), `make webhook-sandbox-restart` (relaunch the receiver with the current `.env`), `make webhook-sandbox-logs`, `make webhook-sandbox-rm`.
+
+> **The URL follows the sandbox ID.** Recreating the sandbox (`make webhook-sandbox-rm` then `make webhook-sandbox`) mints a new ID and a new URL. You do not need a new signing secret: edit the existing webhook's URL in Claude Platform (Manage → Webhooks) and re-enable it if it was disabled. If you do rotate the secret, put the new value in `.env` and run `make webhook-sandbox-restart` to relaunch the receiver in place; the sandbox ID and URL stay the same.
 
 > **One credential, one project.** The image is built and the sandbox is created against whatever Tensorlake project your credentials point at. The Python SDK uses `TENSORLAKE_API_KEY`; the `tl` CLI uses your `tl login` session — if those resolve to *different* projects, `make build-webhook` registers the image in one project while `make webhook-sandbox` looks for it in another and fails with *"Image … is not registered"*. Keep both pointed at the same project.
 
