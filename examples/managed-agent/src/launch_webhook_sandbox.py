@@ -22,8 +22,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from tensorlake.sandbox import Sandbox, SandboxNotFoundError
-
+# Import config before the tensorlake SDK: config.load_env() populates
+# os.environ from .env, and tensorlake.sandbox snapshots TENSORLAKE_API_KEY
+# into its parameter defaults at import time. Reverse the order and a key that
+# lives only in .env is missed, so Sandbox.* fails with 401 AUTH_REQUIRED.
 from config import (
     WEBHOOK_SANDBOX_IMAGE_NAME,
     WEBHOOK_SANDBOX_NAME,
@@ -32,6 +34,8 @@ from config import (
     WEBHOOK_SANDBOX_TIMEOUT_SECONDS,
     required_env,
 )
+
+from tensorlake.sandbox import Sandbox, SandboxNotFoundError
 
 
 # Credentials the in-sandbox receiver needs: the environment key for the
