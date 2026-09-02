@@ -8,7 +8,7 @@ dependencies = [
     "anthropic[webhooks]>=0.103.0",
     "dotenv>=0.9.9",
     "fastapi>=0.136.1",
-    "tensorlake>=0.2",
+    "tensorlake>=0.5.120",
     "uvicorn>=0.30",
 ]
 

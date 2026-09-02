@@ -40,20 +40,13 @@ SANDBOX_DISK_MB = 25_600
 SANDBOX_TIMEOUT_SECONDS = 3600
 APP_SANDBOX_WORKDIR = "/workspace"
 
-# Long-running sessions: resume instead of recreate.
-# At SANDBOX_TIMEOUT_SECONDS an idle per-session sandbox auto-suspends (state
-# frozen to a snapshot, nothing billed). When the session's next work item
-# arrives, this flag decides what happens:
-#   False (default) — skip the suspended sandbox and create a fresh one from the
-#     base image. Clean slate per burst; safe when each burst is independent.
-#   True            — resume the suspended sandbox (memory-snapshot restore,
-#     sub-second, with /workspace + installed deps + warm caches intact). The
-#     right call for a long-lived session whose accumulated in-sandbox state is
-#     the point. Idle cost is identical either way — both suspend; the
-#     difference is whether resume rebuilds or restores.
-APP_RESUME_SUSPENDED_SESSIONS = os.environ.get(
-    "RESUME_SUSPENDED_SESSIONS", "false"
-).lower() in ("1", "true", "yes")
+# Long-running sessions. At SANDBOX_TIMEOUT_SECONDS an idle per-session
+# sandbox auto-suspends (state frozen to a snapshot, nothing billed). When the
+# session's next work item arrives, Sandbox.get_or_create() resumes it: a
+# memory-snapshot restore, sub-second, with /workspace, installed deps, and
+# warm caches intact. Idle cost is the same as recreating; resume is faster and
+# keeps the agent's accumulated state.
+
 # Must live somewhere the sandbox's non-root runtime user can read. /root is
 # mode 700, so the runner launched via start_process() (which does NOT run as
 # root) gets "Permission denied" opening the script and the worker never starts.

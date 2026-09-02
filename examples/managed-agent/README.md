@@ -2,7 +2,7 @@
 
 A reference integration that uses [Tensorlake Sandboxes](https://docs.tensorlake.ai/sandboxes/introduction) as the execution environment for [Claude Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview). It ships the platform-integration core — image build, the in-sandbox worker, and **one orchestrator in three runnable modes** — and you drive sessions with the Anthropic SDK. The agent loop and the sandbox executions all happen remotely; you can disconnect and resume.
 
-The orchestrator's job is always the same: consume Anthropic's work queue and get-or-create a Tensorlake sandbox per session (`src/orchestrator_lib.py`). What differs is where it runs:
+The orchestrator's job is always the same: consume Anthropic's work queue and `Sandbox.get_or_create()` a Tensorlake sandbox per session (`src/orchestrator_lib.py`). What differs is where it runs:
 
 | Mode | Run | Where it runs | Spawn latency | Needs |
 |---|---|---|---|---|
@@ -17,7 +17,7 @@ flowchart LR
         drain["orchestrator_lib.Orchestrator<br/>drain queue → sandbox per session"]
     end
     harness <-->|"poll or webhook push<br/>(host, or inside a sandbox)"| drain
-    drain -->|"Sandbox.create + start_process"| tsbx["Tensorlake sandbox<br/>per session"]
+    drain -->|"Sandbox.get_or_create + start_process"| tsbx["Tensorlake sandbox<br/>per session"]
     tsbx -->|"worker attaches back"| harness
 ```
 
@@ -36,7 +36,7 @@ cp .env.local.example .env.local
 ### Tensorlake
 
 1. Sign up at [cloud.tensorlake.ai](https://cloud.tensorlake.ai) and copy your API key. Set `TENSORLAKE_API_KEY` in `.env`.
-2. Install the CLI and SDK, then login:
+2. Install the CLI and SDK (tensorlake >= 0.5.120, for `Sandbox.get_or_create`), then login:
    ```bash
    uv sync
    uv run tl login   # or: export TENSORLAKE_API_KEY=...
@@ -193,8 +193,9 @@ If that count doesn't match the project you intend, fix the key in `.env` (it no
 
 ## Notes
 
+- **One sandbox per session, one call.** The sandbox name is derived from the Anthropic session ID (`agent-<slugified session id>`), and `Sandbox.get_or_create(name, image=..., cpus=..., ...)` is the whole lookup: it attaches when the sandbox is running, resumes it when it is suspended, and creates it when the name is free. Concurrent callers with the same name converge on the same sandbox, so the orchestrator needs no list-and-match and no per-session lock. `sandbox.bind_outcome` tells you which path was taken (`created` / `attached` / `resumed`). The size and image arguments apply only on create; an existing sandbox keeps its own. `Sandbox.connect()` also accepts a name, which is how the webhook launcher's `--status` / `--logs` / `--terminate` find their sandbox.
 - **Env injection.** `Sandbox.create()` takes no arbitrary `env={...}` dict, and the current SDK (0.5.30) no longer accepts `secret_names` either (the server rejects it). So the orchestrator passes *every* var the in-sandbox runner needs — including `ANTHROPIC_ENVIRONMENT_KEY` alongside the per-session `ANTHROPIC_SESSION_ID` / `ANTHROPIC_WORK_ID` / `ANTHROPIC_ENVIRONMENT_ID` — per-command via `start_process(env={...})`, which merges on top of the sandbox base environment. No pre-registered secret, no temp env file.
-- **Idle cleanup.** Sandboxes auto-suspend via `timeout_secs` in every mode. The host modes additionally run a janitor thread for the stuck-`failed` edge case.
+- **Idle cleanup.** Sandboxes auto-suspend via `timeout_secs` in every mode; the next work item for that session resumes the suspended sandbox through `get_or_create` (sub-second, with `/workspace` and installed deps intact). The host modes additionally run a janitor thread for the stuck-`failed` edge case.
 - **Preview URLs.** Expose a server inside the sandbox with `Sandbox.update(exposed_ports=[8080], allow_unauthenticated_access=True)` — what `launch_webhook_sandbox.py` does for `:5051` — which serves it at `https://8080-{sandbox_id}.sandbox.tensorlake.ai` (keyed by sandbox ID, not name).
 - **Concurrent spin-up (sync vs async).** This example is intentionally synchronous: the receiver acks each webhook immediately and drains in the background, but a single drain holds `_drain_lock` and walks the queue in a sequential `for` loop (`orchestrator_lib.py`), so a burst of sessions has its sandboxes created **one at a time**. It never drops or double-spawns work (get-or-create is idempotent per session), it just isn't parallel. Tensorlake also ships an async API — `AsyncSandbox` / `AsyncSandboxClient` in `tensorlake.sandbox`, full method parity — which pairs with the documented async worker (`client.beta.environments.work.poller(...)`, the async-only counterpart to the sync `iter_work` used here). Switching the orchestrator to `AsyncAnthropic` + `AsyncSandbox` lets one drain create sandboxes **concurrently** via `asyncio.gather`, bounded by a semaphore for your Tensorlake concurrent-sandbox quota; the per-session idempotency lock carries over as an `asyncio.Lock`. Left out here to keep the reference path readable — reach for it when burst spin-up latency matters.
 - **Where this goes next — multi-step tool calls.** This example's orchestrator is a thin, stateless dispatcher: one work item → one sandbox. A natural extension is a tool call that is really a *multi-step pipeline* — fan out N sandboxes from a single snapshot, run them in parallel, and join the results. That fan-out primitive (`checkpoint()` → `Sandbox.create(snapshot_id=...)`) is the [parallel-sub-agents](../parallel-sub-agents) example.

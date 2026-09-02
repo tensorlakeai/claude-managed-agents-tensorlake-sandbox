@@ -1,15 +1,19 @@
 """
 Shared orchestration logic used by every orchestrator entrypoint — host
 polling, host webhook, and the webhook receiver running inside a Tensorlake
-sandbox: get-or-create a Tensorlake sandbox per active session, launch the
-in-sandbox runner, and drain Anthropic's work queue.
+sandbox: Sandbox.get_or_create() a Tensorlake sandbox per active session,
+launch the in-sandbox runner, and drain Anthropic's work queue.
 
 The environment-specific state (environment ID/key, Anthropic client, locks)
 lives on the `Orchestrator` class, populated from env vars via
 `Orchestrator.from_env()`.
 
 Key Tensorlake-specific details:
-- Sandbox lookup is by `name`, not by ID, via Sandbox.connect().
+- The sandbox name is derived from the Anthropic session ID (see
+  sandbox_name), so Sandbox.get_or_create(name) is the whole lookup: it
+  attaches to the session's sandbox if one exists (resuming it when
+  suspended) and creates it otherwise. Concurrent callers converge on the
+  same sandbox, so no client-side locking or list-and-match is needed.
 """
 
 from __future__ import annotations
@@ -30,7 +34,6 @@ from datetime import datetime, timezone
 # (never exported in the shell) is missed entirely — Sandbox.* 401s with
 # AUTH_REQUIRED. Keep this import first among the third-party imports.
 from config import (
-    APP_RESUME_SUSPENDED_SESSIONS,
     APP_SANDBOX_ENTRYPOINT_PATH,
     SANDBOX_CPUS,
     SANDBOX_IMAGE_NAME,
@@ -63,8 +66,8 @@ def sandbox_name(session_id: str) -> str:
     # Tensorlake sandbox names allow only lowercase letters, digits, and
     # hyphens, but Anthropic session IDs contain underscores and uppercase
     # (e.g. "sesn_01H2ZZ..."). Lowercase and map every disallowed character to
-    # a hyphen so the name is valid. This is deterministic, so the get-or-create
-    # lookup in find_sandbox_by_name stays consistent.
+    # a hyphen so the name is valid. This is deterministic, so every work item
+    # for a session resolves to the same Sandbox.get_or_create() name.
     slug = re.sub(r"[^a-z0-9-]", "-", session_id.lower())
     return f"agent-{slug}"
 
@@ -75,48 +78,6 @@ def _status_str(info: object) -> str | None:
     return getattr(status, "value", status)
 
 
-def find_sandbox_by_name(name: str, *, include_suspended: bool = True) -> Sandbox | None:
-    """Resolve a named sandbox to a connected handle.
-
-    Sandbox.connect() takes a sandbox ID, not a name, so we list sandboxes,
-    match on name, and connect by sandbox_id. Terminated/failed matches are
-    skipped; suspended ones are skipped too when include_suspended is False.
-    """
-    try:
-        infos = [i for i in Sandbox.list() if getattr(i, "name", None) == name]
-    except Exception as e:
-        log.debug(f"Sandbox.list() failed: {type(e).__name__}: {e}")
-        return None
-    for info in infos:
-        status = _status_str(info)
-        if status in ("terminated", "failed"):
-            continue
-        if status == "suspended" and not include_suspended:
-            log.info(f"sandbox {name} exists but status={status}")
-            continue
-        try:
-            return Sandbox.connect(info.sandbox_id)
-        except Exception as e:
-            log.debug(f"connect({info.sandbox_id}) failed: {type(e).__name__}: {e}")
-    return None
-
-
-def _find_live_sandbox(name: str) -> Sandbox | None:
-    # Default: a suspended sandbox is treated as not-live, so process_work_item
-    # recreates it (clean slate per burst) rather than reusing a paused one.
-    #
-    # With APP_RESUME_SUSPENDED_SESSIONS set, suspended sandboxes are included
-    # instead: find_sandbox_by_name connects to one by sandbox_id, and the
-    # subsequent inbound operation (the runner relaunch in process_work_item)
-    # resumes it — a memory-snapshot restore that brings /workspace, installed
-    # deps, and warm caches back intact in well under a second. Use this for
-    # long-running sessions whose accumulated in-sandbox state is worth keeping
-    # across idle gaps; leave it off when each burst should start fresh.
-    return find_sandbox_by_name(
-        name, include_suspended=APP_RESUME_SUSPENDED_SESSIONS
-    )
-
-
 class Orchestrator:
     """Per-environment orchestration: one instance per ANTHROPIC_ENVIRONMENT_ID."""
 
@@ -125,8 +86,6 @@ class Orchestrator:
         self.environment_key = environment_key
         self.client = anthropic.Anthropic(auth_token=environment_key)
         self._drain_lock = threading.RLock()
-        self._session_locks_lock = threading.Lock()
-        self._session_locks: dict[str, threading.RLock] = {}
 
     @classmethod
     def from_env(cls) -> Orchestrator:
@@ -135,14 +94,6 @@ class Orchestrator:
             environment_id=required_env("ANTHROPIC_ENVIRONMENT_ID"),
             environment_key=required_env("ANTHROPIC_ENVIRONMENT_KEY"),
         )
-
-    def _session_lock(self, session_id: str) -> threading.RLock:
-        with self._session_locks_lock:
-            lock = self._session_locks.get(session_id)
-            if lock is None:
-                lock = threading.RLock()
-                self._session_locks[session_id] = lock
-            return lock
 
     def _session_env(self, *, session_id: str, work_id: str) -> dict[str, str]:
         # The environment key used to be injected via secret_names; the current
@@ -164,51 +115,35 @@ class Orchestrator:
             env=self._session_env(session_id=session_id, work_id=work_id),
         )
 
-    def _create_sandbox(self, session_id: str, work_id: str) -> Sandbox:
+    def process_work_item(self, *, session_id: str, work_id: str) -> dict:
+        """Get-or-create the session's Tensorlake sandbox for one ack'd work item."""
         name = sandbox_name(session_id)
-        sb = Sandbox.create(
-            name=name,
+        # One call covers every case: no sandbox yet -> create it (blocks
+        # until running); sandbox running -> attach; sandbox suspended at
+        # timeout_secs -> resume it (memory-snapshot restore, sub-second, with
+        # /workspace, installed deps, and warm caches intact). The size/image
+        # arguments apply only on create; an existing sandbox keeps its own.
+        sb = Sandbox.get_or_create(
+            name,
             image=SANDBOX_IMAGE_NAME,
             cpus=SANDBOX_CPUS,
             memory_mb=SANDBOX_MEMORY_MB,
             timeout_secs=SANDBOX_TIMEOUT_SECONDS,
         )
+        outcome = sb.bind_outcome  # "created" | "attached" | "resumed"
+        log.info(f"work={work_id} session={session_id} sandbox={sb.sandbox_id} ({outcome})")
+        # (Re)launch the runner with fresh per-session env. On attach/resume the
+        # old runner may have exited at max_idle while the sandbox stayed up;
+        # the filesystem state carries over and only the short-lived runner
+        # process is restarted.
         self._launch_runner(sb, session_id=session_id, work_id=work_id)
-        return sb
-
-    def process_work_item(self, *, session_id: str, work_id: str) -> dict:
-        """Get-or-create a Tensorlake sandbox for one already-ack'd work item."""
-        with self._session_lock(session_id):
-            existing = _find_live_sandbox(sandbox_name(session_id))
-            if existing is not None:
-                log.info(
-                    f"work={work_id} session={session_id} "
-                    f"sandbox={existing.sandbox_id} (live)"
-                )
-                # Relaunch the runner with fresh per-session env. The old
-                # process may have exited at max_idle while the sandbox stayed
-                # up; or (with APP_RESUME_SUSPENDED_SESSIONS) the sandbox was
-                # suspended and this start_process is the inbound op that resumes
-                # it. Either way the filesystem state carries over — only the
-                # short-lived runner process is restarted.
-                self._launch_runner(existing, session_id=session_id, work_id=work_id)
-                return {
-                    "session_id": session_id,
-                    "work_id": work_id,
-                    "sandbox_id": existing.sandbox_id,
-                    "created": False,
-                }
-            sb = self._create_sandbox(session_id, work_id)
-            log.info(
-                f"work={work_id} session={session_id} "
-                f"sandbox={sb.sandbox_id} (created)"
-            )
-            return {
-                "session_id": session_id,
-                "work_id": work_id,
-                "sandbox_id": sb.sandbox_id,
-                "created": True,
-            }
+        return {
+            "session_id": session_id,
+            "work_id": work_id,
+            "sandbox_id": sb.sandbox_id,
+            "outcome": outcome,
+            "created": outcome == "created",
+        }
 
     def drain_work(
         self,
@@ -323,7 +258,7 @@ def janitor_loop() -> None:
     failed state.
 
     Sandbox.list() yields SandboxInfo records (no callable lifecycle methods);
-    Sandbox.connect(sandbox_id) returns an operable Sandbox handle.
+    Sandbox.connect() returns an operable Sandbox handle.
     """
     name_prefix = "agent-"
     while not shutdown.is_set():

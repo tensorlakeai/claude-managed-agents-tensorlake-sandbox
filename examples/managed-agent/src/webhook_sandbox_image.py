@@ -39,7 +39,7 @@ def build() -> None:
         )
         .run(
             "python3 -m pip install --break-system-packages --no-cache-dir "
-            "'anthropic[webhooks]>=0.103' 'tensorlake>=0.2' 'fastapi>=0.136' 'uvicorn>=0.30'"
+            "'anthropic[webhooks]>=0.103' 'tensorlake>=0.5.120' 'fastapi>=0.136' 'uvicorn>=0.30'"
         )
         .run(f"mkdir -p {WEBHOOK_SANDBOX_SRC_DIR}")
     )
