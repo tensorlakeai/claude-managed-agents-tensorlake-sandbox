@@ -13,6 +13,7 @@ webhook/curl resumes it. See the README's test plan.
 Usage:
     uv run python src/launch_webhook_sandbox.py              # get-or-create, print URL
     uv run python src/launch_webhook_sandbox.py --status     # status + URL, no changes
+    uv run python src/launch_webhook_sandbox.py --restart    # relaunch the receiver with the current .env
     uv run python src/launch_webhook_sandbox.py --logs       # print the receiver log
     uv run python src/launch_webhook_sandbox.py --terminate  # tear down
 """
@@ -22,8 +23,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from tensorlake.sandbox import Sandbox, SandboxInfo
-
+# Import config before the tensorlake SDK: config.load_env() populates
+# os.environ from .env, and tensorlake.sandbox snapshots TENSORLAKE_API_KEY
+# into its parameter defaults at import time. Reverse the order and a key that
+# lives only in .env is missed, so Sandbox.* fails with 401 AUTH_REQUIRED.
 from config import (
     WEBHOOK_SANDBOX_IMAGE_NAME,
     WEBHOOK_SANDBOX_NAME,
@@ -32,6 +35,8 @@ from config import (
     WEBHOOK_SANDBOX_TIMEOUT_SECONDS,
     required_env,
 )
+
+from tensorlake.sandbox import Sandbox, SandboxNotFoundError, SandboxStatus
 
 
 # Credentials the in-sandbox receiver needs: the environment key for the
@@ -56,32 +61,16 @@ def public_url(sandbox_id: str) -> str:
     return f"https://{WEBHOOK_SANDBOX_PORT}-{sandbox_id}.sandbox.tensorlake.ai"
 
 
-def _status_str(info: SandboxInfo) -> str | None:
-    """Normalize a SandboxStatus enum (or plain str) to its string value."""
-    status = getattr(info, "status", None)
-    return getattr(status, "value", status)
+def _connect() -> Sandbox | None:
+    """Attach to our webhook sandbox by name, or return None if there is none.
 
-
-def _find_info() -> SandboxInfo | None:
-    """Return the live SandboxInfo for our webhook sandbox, or None.
-
-    Lookup is by name via Sandbox.list() because connect() takes a sandbox ID,
-    not a name. Terminated/failed records are skipped so a stale one doesn't
-    mask a missing sandbox.
+    Sandbox.connect() accepts a name as well as an ID and does not resume a
+    suspended sandbox, so --status can observe "suspended" without waking it.
     """
     try:
-        for info in Sandbox.list():
-            if getattr(info, "name", None) != WEBHOOK_SANDBOX_NAME:
-                continue
-            if _status_str(info) in ("terminated", "failed"):
-                continue
-            return info
-    except Exception as e:
-        print(
-            f"warning: Sandbox.list() failed: {type(e).__name__}: {e}",
-            file=sys.stderr,
-        )
-    return None
+        return Sandbox.connect(WEBHOOK_SANDBOX_NAME)
+    except SandboxNotFoundError:
+        return None
 
 
 def _print_endpoints(sandbox_id: str, status: str) -> None:
@@ -94,90 +83,126 @@ def _print_endpoints(sandbox_id: str, status: str) -> None:
     print("Run started) and put its signing secret in ANTHROPIC_WEBHOOK_SIGNING_KEY.")
 
 
+def _receiver_env() -> dict[str, str]:
+    """Everything the in-sandbox receiver needs, read from the host .env.
+
+    Validated host-side so a typo fails here, not silently in the sandbox. The
+    two credentials that used to ride secret_names travel as process env too.
+    """
+    env = {
+        "ANTHROPIC_ENVIRONMENT_ID": required_env("ANTHROPIC_ENVIRONMENT_ID"),
+        "ANTHROPIC_WEBHOOK_SIGNING_KEY": required_env("ANTHROPIC_WEBHOOK_SIGNING_KEY"),
+    }
+    env.update({name: required_env(name) for name in CREDENTIAL_ENV_NAMES})
+    return env
+
+
+def _start_receiver(sb: Sandbox, env: dict[str, str]) -> None:
+    # All of the receiver's config and credentials ride the process env at
+    # launch (the create API no longer takes secret_names).
+    sb.start_process("bash", ["-lc", UVICORN_CMD], env=env)
+
+
 def launch() -> None:
-    # Validated host-side so a typo fails here, not silently in the sandbox.
-    environment_id = required_env("ANTHROPIC_ENVIRONMENT_ID")
-    webhook_secret = required_env("ANTHROPIC_WEBHOOK_SIGNING_KEY")
-    # The two credentials that used to ride secret_names now travel as process
-    # env; fail fast here if either is missing from the host .env.
-    credentials = {name: required_env(name) for name in CREDENTIAL_ENV_NAMES}
+    env = _receiver_env()
 
-    info = _find_info()
-    status = _status_str(info) if info is not None else None
-
-    if info is not None and status == "suspended":
-        # Explicit resume for the launcher path. The wake-on-request
-        # experiment is the opposite: skip this script and just curl the
-        # public URL while suspended.
-        print(f"resuming suspended sandbox {WEBHOOK_SANDBOX_NAME} (id={info.sandbox_id})...")
-        Sandbox.connect(info.sandbox_id).resume()
-        _print_endpoints(info.sandbox_id, "running")
-        return
-    if info is not None:
-        _print_endpoints(info.sandbox_id, str(status))
-        return
-
-    print(f"creating sandbox {WEBHOOK_SANDBOX_NAME}...")
-    sb = Sandbox.create(
-        name=WEBHOOK_SANDBOX_NAME,
+    # get_or_create is the whole lifecycle: attach to a running sandbox,
+    # resume a suspended one, or create it when the name is free. The size,
+    # image, and timeout apply only on create; an existing sandbox keeps its
+    # own. (The wake-on-request experiment is the opposite path: skip this
+    # script and just curl the public URL while suspended.)
+    sb = Sandbox.get_or_create(
+        WEBHOOK_SANDBOX_NAME,
         image=WEBHOOK_SANDBOX_IMAGE_NAME,
         cpus=1.0,
         memory_mb=2048,
         timeout_secs=WEBHOOK_SANDBOX_TIMEOUT_SECONDS,
     )
+    if sb.bind_outcome != "created":
+        # Already existed: the port is exposed and uvicorn is still running
+        # (resume restores memory and processes), so there is nothing to start.
+        print(f"{sb.bind_outcome} sandbox {WEBHOOK_SANDBOX_NAME} (id={sb.sandbox_id})")
+        _print_endpoints(sb.sandbox_id, "running")
+        return
+
+    print(f"created sandbox {WEBHOOK_SANDBOX_NAME} (id={sb.sandbox_id})")
     sb.update(
         exposed_ports=[WEBHOOK_SANDBOX_PORT],
         allow_unauthenticated_access=True,
     )
-    # All of the receiver's config and credentials ride the process env at
-    # launch (the create API no longer takes secret_names).
-    sb.start_process(
-        "bash",
-        ["-lc", UVICORN_CMD],
-        env={
-            "ANTHROPIC_ENVIRONMENT_ID": environment_id,
-            "ANTHROPIC_WEBHOOK_SIGNING_KEY": webhook_secret,
-            **credentials,
-        },
-    )
+    _start_receiver(sb, env)
+    _print_endpoints(sb.sandbox_id, "running")
+
+
+def restart() -> None:
+    """Relaunch the receiver inside the existing sandbox with the current .env.
+
+    Use this after rotating ANTHROPIC_WEBHOOK_SIGNING_KEY (or any other value
+    the receiver reads at startup). The sandbox, and therefore its ID-keyed
+    public URL, stays the same, so the webhook registration in Claude Platform
+    keeps pointing at it. Terminating and recreating would mint a new ID and
+    force a new registration.
+    """
+    env = _receiver_env()
+    sb = _connect()
+    if sb is None:
+        print(f"sandbox {WEBHOOK_SANDBOX_NAME}: not found; run without flags to create it")
+        raise SystemExit(1)
+    if sb.status == SandboxStatus.SUSPENDED:
+        print(f"resuming suspended sandbox {WEBHOOK_SANDBOX_NAME}...")
+        sb.resume()
+    # The receiver was started as `bash -lc "exec python3 -m uvicorn ..."`, so
+    # after exec the surviving process is the uvicorn python command; match on
+    # its module argument. `|| true` so a receiver that already died is fine.
+    sb.run("bash", ["-lc", "pkill -f 'uvicorn.*claude_webhook_handler' || true"])
+    _start_receiver(sb, env)
+    print(f"restarted receiver in sandbox {WEBHOOK_SANDBOX_NAME} (id={sb.sandbox_id})")
     _print_endpoints(sb.sandbox_id, "running")
 
 
 def show_status() -> None:
-    info = _find_info()
-    if info is None:
+    sb = _connect()
+    if sb is None:
         print(f"sandbox {WEBHOOK_SANDBOX_NAME}: not found")
         return
-    _print_endpoints(info.sandbox_id, str(_status_str(info)))
+    # .status is a control-plane read, not proxied traffic, so it does not
+    # count as inbound activity and does not wake a suspended sandbox.
+    _print_endpoints(sb.sandbox_id, sb.status.value)
 
 
 def show_logs() -> None:
-    info = _find_info()
-    if info is None:
+    sb = _connect()
+    if sb is None:
         print(f"sandbox {WEBHOOK_SANDBOX_NAME}: not found", file=sys.stderr)
         raise SystemExit(1)
-    sb = Sandbox.connect(info.sandbox_id)
     print(sb.read_file(RECEIVER_LOG).decode(errors="replace"))
 
 
 def terminate() -> None:
-    info = _find_info()
-    if info is None:
+    sb = _connect()
+    if sb is None:
         print(f"sandbox {WEBHOOK_SANDBOX_NAME}: not found, nothing to do")
         return
-    Sandbox.connect(info.sandbox_id).terminate()
-    print(f"terminated sandbox {WEBHOOK_SANDBOX_NAME} (id={info.sandbox_id})")
+    sb.terminate()
+    print(f"terminated sandbox {WEBHOOK_SANDBOX_NAME} (id={sb.sandbox_id})")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--status", action="store_true", help="print status + URL")
+    action.add_argument(
+        "--restart",
+        action="store_true",
+        help="relaunch the receiver in the existing sandbox with the current .env",
+    )
     action.add_argument("--logs", action="store_true", help="print the receiver log")
     action.add_argument("--terminate", action="store_true", help="tear down")
     args = parser.parse_args()
     if args.status:
         show_status()
+    elif args.restart:
+        restart()
     elif args.logs:
         show_logs()
     elif args.terminate:
